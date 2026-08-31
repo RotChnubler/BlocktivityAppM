@@ -1,0 +1,1369 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<title>Tagesplan</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          paper:  '#F7F7F4',
+          card:   '#FFFFFF',
+          ink:    '#1B1B18',
+          muted:  '#8B8B80',
+          line:   '#E7E7E1',
+          moss:   '#4F6F52',
+          mossLt: '#E4EBE3',
+          warn:   '#A4553C'
+        }
+      }
+    }
+  }
+</script>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  // Babel 8 übersetzt JSX standardmässig in import-Anweisungen ("automatic runtime").
+  // Die funktionieren in einem gewöhnlichen <script> nicht. Dieses Preset erzwingt
+  // React.createElement, passend zu den UMD-Builds oben.
+  Babel.registerPreset('react-classic', {
+    presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+  });
+</script>
+
+<style>
+  html, body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .num { font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .safe-top { padding-top: env(safe-area-inset-top); }
+  .safe-bottom { padding-bottom: calc(env(safe-area-inset-bottom) + 0.5rem); }
+  input, select, textarea { font-size: 16px; } /* verhindert Zoom auf iOS */
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+
+<body class="bg-paper text-ink">
+<div id="root"></div>
+
+<!-- Stummes Audio: hält die Audio-Session auf iOS offen, damit der Alarm am Ende klingen darf -->
+<audio id="silent-keepalive" loop playsinline
+  src="data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA"></audio>
+
+<script type="text/babel" data-presets="react-classic">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+/* ══════════════════════════════════════════════════════════════
+   1. SPEICHER  —  hier später auf localStorage umstellen
+   ══════════════════════════════════════════════════════════════ */
+const STORAGE_KEY = 'tagesplan.v1';
+
+function loadState() {
+  // ---- localStorage-Variante: die nächsten 4 Zeilen einkommentieren ----
+  // try {
+  //   const raw = localStorage.getItem(STORAGE_KEY);
+  //   if (raw) return migrate(JSON.parse(raw));
+  // } catch (e) { console.warn('Laden fehlgeschlagen', e); }
+  return demoState();
+}
+
+function saveState(state) {
+  // ---- localStorage-Variante: die nächsten 3 Zeilen einkommentieren ----
+  // try {
+  //   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  // } catch (e) { console.warn('Speichern fehlgeschlagen', e); }
+}
+
+function migrate(s) {
+  return {
+    version: 2,
+    categories: (s.categories || []).map((c, i) => ({
+      color: CATEGORY_COLORS[i % CATEGORY_COLORS.length].hex,
+      ...c
+    })),
+    tasks: (s.tasks || []).map(t => ({
+      active: true,
+      ...t,
+      // Wochentage: 0 = Sonntag … 6 = Samstag. Ältere Dateien nutzten 1–7.
+      plannedWeekdays: normalizeWeekdays(t.plannedWeekdays)
+    })),
+    log: s.log || {},
+    plans: s.plans || {},
+    session: s.session || null
+  };
+}
+
+function normalizeWeekdays(list) {
+  if (!Array.isArray(list)) return [0, 1, 2, 3, 4, 5, 6];
+  if (list.includes(7)) return [0, 1, 2, 3, 4, 5, 6];       // altes 1–7-Schema
+  return list.filter(n => n >= 0 && n <= 6).sort();
+}
+
+/* ══════════════════════════════════════════════════════════════
+   2. DATENMODELL
+   ──────────────────────────────────────────────────────────────
+   category : { id, name }
+   task     : { id, categoryId, name, type:'timer'|'counter'|'check',
+                target, active, plannedWeekdays }
+                plannedWeekdays sind die Standardtage der Task
+                (0 = Sonntag … 6 = Samstag). Sie greifen, solange für
+                eine Woche nichts Konkretes gespeichert ist.
+   log      : { "2026-08-26": { [taskId]: { value, entries:[{id, amount, at}] } } }
+                value ist in der Basiseinheit der Task:
+                timer → Sekunden · counter → Einheiten · check → 0/1
+   plans    : { "2026-08-23": { [taskId]: [0,3,5] } }
+                Konkrete Planung je Woche, geschlüsselt nach dem Sonntag
+                der Woche. Existiert für eine Woche kein Eintrag, gilt
+                automatisch die letzte gespeicherte Woche davor —
+                so wie sie am Ende tatsächlich aussah.
+   session  : { taskId, dayKey, durationMs, accMs, startedAt, paused }
+   ══════════════════════════════════════════════════════════════ */
+
+/* Ruhige Palette für Kategorien. Gespeichert wird der Hex-Wert, damit die
+   Farbe auch nach einem Export/Import stimmt und nicht von einem Namen abhängt. */
+const CATEGORY_COLORS = [
+  { hex: '#4F6F52', name: 'Moos' },
+  { hex: '#3F6B76', name: 'Petrol' },
+  { hex: '#5B5E8C', name: 'Indigo' },
+  { hex: '#7A5573', name: 'Pflaume' },
+  { hex: '#A4553C', name: 'Ton' },
+  { hex: '#9A7B3F', name: 'Ocker' },
+  { hex: '#6E7B52', name: 'Oliv' },
+  { hex: '#5A5A52', name: 'Graphit' }
+];
+const DEFAULT_COLOR = CATEGORY_COLORS[0].hex;
+
+function colorOfCategory(categories, categoryId) {
+  const c = categories.find(x => x.id === categoryId);
+  return (c && c.color) || DEFAULT_COLOR;
+}
+/* Farbe mit Deckkraft, für Balkenhintergründe und Zeilentönung. */
+function tint(hex, alpha) {
+  const a = Math.round(alpha * 255).toString(16).padStart(2, '0');
+  return hex + a;
+}
+
+const WEEKDAYS = ['Sonntag', 'Montag', 'Dienstag', 'Mittwoch', 'Donnerstag', 'Freitag', 'Samstag'];
+const WEEKDAYS_SHORT = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+
+const DAY_ROLL_HOUR = 4;               // Tageswechsel um 04:00
+const uid = () => Math.random().toString(36).slice(2, 10);
+const pad = n => String(n).padStart(2, '0');
+
+function toKey(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function dayKeyFor(ts) {
+  const d = new Date(ts - DAY_ROLL_HOUR * 3600000);
+  return toKey(d);
+}
+const todayKey = () => dayKeyFor(Date.now());
+
+function dateFromKey(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+function weekdayOfKey(key) { return dateFromKey(key).getDay(); }
+
+/* Die Woche läuft Montag bis Sonntag; als Schlüssel dient ihr Montag.
+   Die Wochentagsnummern bleiben beim JS-Schema (0 = Sonntag … 6 = Samstag),
+   damit gespeicherte Planungen unverändert gültig bleiben. Nur die
+   Reihenfolge der Anzeige richtet sich nach WEEK_ORDER. */
+const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0];
+
+function weekKeyOf(dayKey) {
+  const d = dateFromKey(dayKey);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));   // zurück auf den Montag
+  return toKey(d);
+}
+function dayKeyInWeek(weekKey, weekday) {
+  const d = dateFromKey(weekKey);
+  d.setDate(d.getDate() + ((weekday + 6) % 7));      // Montag = Position 0
+  return toKey(d);
+}
+function nextWeekKey(weekKey) {
+  const d = dateFromKey(weekKey);
+  d.setDate(d.getDate() + 7);
+  return toKey(d);
+}
+
+/* Letzte gespeicherte Woche vor weekKey — Grundlage der automatischen Übernahme. */
+function lastStoredPlanBefore(plans, weekKey) {
+  const keys = Object.keys(plans).filter(k => k < weekKey).sort();
+  return keys.length ? plans[keys[keys.length - 1]] : null;
+}
+
+/* Was in dieser Woche tatsächlich gilt: die gespeicherte Planung, sonst die der
+   Vorwoche, sonst die Standardtage der Task. Neu angelegte Tasks sind in einer
+   bereits gespeicherten Woche nicht enthalten und fallen auf ihre Standardtage
+   zurück — so tauchen sie unter der Woche automatisch auf. */
+function effectivePlan(state, weekKey) {
+  const base = state.plans[weekKey] || lastStoredPlanBefore(state.plans, weekKey) || {};
+  const out = {};
+  state.tasks.forEach(t => {
+    out[t.id] = Array.isArray(base[t.id]) ? base[t.id] : normalizeWeekdays(t.plannedWeekdays);
+  });
+  return out;
+}
+
+function baseTarget(task) {
+  if (task.type === 'timer') return Math.max(1, task.target) * 60;   // Sekunden
+  if (task.type === 'check') return 1;
+  return Math.max(1, task.target);
+}
+function entryOf(log, key, taskId) {
+  return (log[key] && log[key][taskId]) || { value: 0, entries: [] };
+}
+function displayProgress(task, value) {
+  if (task.type === 'timer') return { cur: Math.floor(value / 60), max: task.target, unit: 'Min' };
+  if (task.type === 'check') return { cur: value ? 1 : 0, max: 1, unit: '' };
+  return { cur: value, max: task.target, unit: '' };
+}
+function fmtClock(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+}
+function fmtDate(key) {
+  const [y, m, d] = key.split('-').map(Number);
+  const date = new Date(y, m - 1, d);
+  return date.toLocaleDateString('de-CH', { weekday: 'long', day: 'numeric', month: 'long' });
+}
+
+function demoState() {
+  const c = [
+    { id: 'c-sport',   name: 'Sport',   color: CATEGORY_COLORS[0].hex },
+    { id: 'c-lesen',   name: 'Lesen',   color: CATEGORY_COLORS[1].hex },
+    { id: 'c-musik',   name: 'Musik',   color: CATEGORY_COLORS[3].hex },
+    { id: 'c-studium', name: 'Studium', color: CATEGORY_COLORS[5].hex }
+  ];
+  const t = (categoryId, name, type, target, days) => ({
+    id: uid(), categoryId, name, type, target,
+    active: true, plannedWeekdays: days
+  });
+  const ALLE = [0, 1, 2, 3, 4, 5, 6];
+  return {
+    version: 2,
+    categories: c,
+    tasks: [
+      t('c-sport',   'Jogging',      'timer',   20, [2, 4, 6]),
+      t('c-sport',   'Kraft',        'timer',   15, [1, 3]),
+      t('c-sport',   'Mobility',     'timer',    8, ALLE),
+      t('c-lesen',   'Seiten',       'counter', 20, ALLE),
+      t('c-musik',   'Klavier',      'timer',   15, [1, 2, 3, 4, 5]),
+      t('c-studium', 'Karteikarten', 'counter', 40, [1, 2, 3, 4, 5]),
+      t('c-studium', 'Vitamine',     'check',    1, ALLE)
+    ],
+    log: {},
+    plans: {},
+    session: null
+  };
+}
+
+/* ══════════════════════════════════════════════════════════════
+   3. TON & WAKE LOCK
+   ══════════════════════════════════════════════════════════════ */
+let audioCtx = null;
+
+function primeAudio() {
+  // Muss aus einer Nutzerinteraktion heraus laufen (iOS-Regel).
+  try {
+    const el = document.getElementById('silent-keepalive');
+    if (el) { el.volume = 0.001; el.play().catch(() => {}); }
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+  } catch (e) { /* Ton bleibt stumm, App läuft weiter */ }
+}
+function stopKeepalive() {
+  const el = document.getElementById('silent-keepalive');
+  if (el) el.pause();
+}
+function playAlarm() {
+  if (!audioCtx) return;
+  try {
+    const now = audioCtx.currentTime;
+    [0, 0.55, 1.1].forEach((offset, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = i === 2 ? 660 : 880;
+      gain.gain.setValueAtTime(0.0001, now + offset);
+      gain.gain.exponentialRampToValueAtTime(0.25, now + offset + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + offset + 0.42);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(now + offset);
+      osc.stop(now + offset + 0.45);
+    });
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate([200, 120, 200]);
+}
+
+/* ══════════════════════════════════════════════════════════════
+   4. APP
+   ══════════════════════════════════════════════════════════════ */
+function App() {
+  const [state, setState] = useState(loadState);
+  const [screen, setScreen] = useState('heute');     // heute | woche | verwalten | daten
+  const [now, setNow] = useState(Date.now());
+  const [counterFor, setCounterFor] = useState(null);
+  const [taskForm, setTaskForm] = useState(null);
+  const wakeLockRef = useRef(null);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  /* — Zustand ändern und sofort persistieren — */
+  const update = useCallback(fn => {
+    setState(prev => {
+      const next = fn(prev);
+      saveState(next);                 // laufende Session wird sofort mitgeschrieben
+      return next;
+    });
+  }, []);
+
+  /* — Uhr: treibt Timer-Anzeige und Tageswechsel — */
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(id);
+  }, []);
+
+  const today = dayKeyFor(now);
+  const weekKey = weekKeyOf(today);
+  const todayWeekday = weekdayOfKey(today);
+  const plan = useMemo(() => effectivePlan(state, weekKey), [state, weekKey]);
+
+  /* Planung einer Task für die laufende Woche setzen. Beim ersten Eingriff wird
+     die bis dahin nur abgeleitete Planung als konkrete Woche festgeschrieben —
+     ab dann ist sie die Vorlage für die Übernahme in die Folgewoche. */
+  const setPlanDays = useCallback((targetWeek, taskId, days) => {
+    update(prev => {
+      const eff = effectivePlan(prev, targetWeek);
+      eff[taskId] = [...days].sort();
+      return { ...prev, plans: { ...prev.plans, [targetWeek]: eff } };
+    });
+  }, [update]);
+
+  /* Heute sichtbar: alles für heute Geplante — dazu Tasks, an denen heute schon
+     gearbeitet wurde, auch wenn sie inzwischen weggeplant sind. Sonst wäre
+     erfasster Fortschritt vom Bildschirm verschwunden. */
+  const todaysTasks = useMemo(() => state.tasks.filter(t => {
+    if (t.active === false) return false;
+    if ((plan[t.id] || []).includes(todayWeekday)) return true;
+    return entryOf(state.log, today, t.id).value > 0;
+  }), [state.tasks, state.log, plan, todayWeekday, today]);
+
+  /* — Wake Lock — */
+  const acquireWakeLock = useCallback(async () => {
+    try {
+      if ('wakeLock' in navigator) wakeLockRef.current = await navigator.wakeLock.request('screen');
+    } catch (e) {}
+  }, []);
+  const releaseWakeLock = useCallback(() => {
+    try { wakeLockRef.current && wakeLockRef.current.release(); } catch (e) {}
+    wakeLockRef.current = null;
+  }, []);
+
+  /* — Fortschritt schreiben (mit Deckelung auf das Ziel) — */
+  const addProgress = useCallback((taskId, amount, key) => {
+    update(prev => {
+      const task = prev.tasks.find(t => t.id === taskId);
+      if (!task) return prev;
+      const dk = key || dayKeyFor(Date.now());
+      const cur = entryOf(prev.log, dk, taskId);
+      const max = baseTarget(task);
+      const applied = Math.max(-cur.value, Math.min(amount, max - cur.value));
+      if (applied === 0) return prev;
+      const day = { ...(prev.log[dk] || {}) };
+      day[taskId] = {
+        value: cur.value + applied,
+        entries: [...cur.entries, { id: uid(), amount: applied, at: Date.now() }]
+      };
+      return { ...prev, log: { ...prev.log, [dk]: day } };
+    });
+  }, [update]);
+
+  const undoLast = useCallback((taskId, key) => {
+    update(prev => {
+      const dk = key || dayKeyFor(Date.now());
+      const cur = entryOf(prev.log, dk, taskId);
+      if (!cur.entries.length) return prev;
+      const entries = cur.entries.slice(0, -1);
+      const last = cur.entries[cur.entries.length - 1];
+      const day = { ...(prev.log[dk] || {}) };
+      day[taskId] = { value: Math.max(0, cur.value - last.amount), entries };
+      return { ...prev, log: { ...prev.log, [dk]: day } };
+    });
+  }, [update]);
+
+  /* ——— Timer ———
+     Ein Tap auf die Task öffnet den Timer-Screen nur; gestartet wird er dort
+     über den Startknopf. Deshalb hier noch kein Wake Lock und kein Audio. */
+  const openTimer = useCallback(task => {
+    const dk = dayKeyFor(Date.now());
+    const done = entryOf(stateRef.current.log, dk, task.id).value;
+    const remainingSec = baseTarget(task) - done;
+    if (remainingSec <= 0) return;
+    update(prev => ({
+      ...prev,
+      session: {
+        taskId: task.id, dayKey: dk,
+        durationMs: remainingSec * 1000,
+        accMs: 0, startedAt: null, paused: true
+      }
+    }));
+  }, [update]);
+
+  const elapsedOf = s => s ? s.accMs + (s.paused ? 0 : Date.now() - s.startedAt) : 0;
+
+  const pauseTimer = useCallback(() => {
+    update(prev => prev.session && !prev.session.paused
+      ? { ...prev, session: { ...prev.session, accMs: elapsedOf(prev.session), paused: true, startedAt: null } }
+      : prev);
+  }, [update]);
+
+  /* Startet den Timer oder nimmt ihn nach einer Pause wieder auf.
+     Läuft immer aus einem Tap heraus — nur so darf iOS später den Alarm spielen. */
+  const runTimer = useCallback(() => {
+    primeAudio();
+    acquireWakeLock();
+    update(prev => prev.session && prev.session.paused
+      ? { ...prev, session: { ...prev.session, startedAt: Date.now(), paused: false } }
+      : prev);
+  }, [update, acquireWakeLock]);
+
+  /* Beendet die Session und schreibt die verstrichene Zeit gut. */
+  const endTimer = useCallback((completed) => {
+    const s = stateRef.current.session;
+    if (!s) return;
+    const ms = Math.min(elapsedOf(s), s.durationMs);
+    const sec = Math.floor(ms / 1000);
+    if (sec > 0) addProgress(s.taskId, sec, s.dayKey);
+    update(prev => ({ ...prev, session: null }));
+    releaseWakeLock();
+    stopKeepalive();
+    if (completed) playAlarm();
+  }, [addProgress, update, releaseWakeLock]);
+
+  /* Abgelaufene Session erkennen — auch wenn die App zwischendurch eingefroren war. */
+  useEffect(() => {
+    const s = state.session;
+    if (!s) return;
+    if (elapsedOf(s) >= s.durationMs) endTimer(true);
+  }, [now, state.session, endTimer]);
+
+  /* Wake Lock nach Rückkehr in den Vordergrund neu anfordern. */
+  useEffect(() => {
+    const onVis = () => {
+      setNow(Date.now());
+      if (document.visibilityState === 'visible' && stateRef.current.session && !stateRef.current.session.paused) {
+        acquireWakeLock();
+      }
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [acquireWakeLock]);
+
+  /* ——— Kategorien & Tasks verwalten ——— */
+  const addCategory = name => update(p => ({
+    ...p,
+    categories: [
+      { id: uid(), name, color: CATEGORY_COLORS[p.categories.length % CATEGORY_COLORS.length].hex },
+      ...p.categories
+    ]
+  }));
+  const setCategoryColor = (id, color) =>
+    update(p => ({ ...p, categories: p.categories.map(c => c.id === id ? { ...c, color } : c) }));
+  const renameCategory = (id, name) =>
+    update(p => ({ ...p, categories: p.categories.map(c => c.id === id ? { ...c, name } : c) }));
+  const deleteCategory = id => update(p => ({
+    ...p,
+    categories: p.categories.filter(c => c.id !== id),
+    tasks: p.tasks.filter(t => t.categoryId !== id)
+  }));
+  const saveTask = form => update(p => {
+    if (form.id) return { ...p, tasks: p.tasks.map(t => t.id === form.id ? { ...t, ...form } : t) };
+    return { ...p, tasks: [...p.tasks, { ...form, id: uid() }] };
+  });
+  const deleteTask = id => update(p => ({
+    ...p,
+    tasks: p.tasks.filter(t => t.id !== id),
+    session: p.session && p.session.taskId === id ? null : p.session
+  }));
+
+  const replaceState = next => { releaseWakeLock(); saveState(next); setState(next); };
+
+  /* ——— Ansicht ——— */
+  const session = state.session;
+  const sessionTask = session ? state.tasks.find(t => t.id === session.taskId) : null;
+
+  if (session && sessionTask) {
+    return <TimerScreen
+      task={sessionTask}
+      session={session}
+      now={now}
+      elapsed={elapsedOf(session)}
+      alreadyDone={entryOf(state.log, session.dayKey, session.taskId).value}
+      onPause={pauseTimer}
+      onRun={runTimer}
+      onCancel={() => endTimer(false)}
+    />;
+  }
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      <div className="flex-1 pb-28">
+        {screen === 'heute' && (
+          <TodayScreen
+            state={state} today={today} tasks={todaysTasks}
+            onStartTimer={openTimer}
+            onCheck={task => {
+              const v = entryOf(state.log, today, task.id).value;
+              v >= 1 ? undoLast(task.id, today) : addProgress(task.id, 1, today);
+            }}
+            onOpenCounter={setCounterFor}
+          />
+        )}
+        {screen === 'woche' && (
+          <WeekScreen
+            state={state} today={today} weekKey={weekKey}
+            onSetDays={setPlanDays}
+          />
+        )}
+        {screen === 'verwalten' && (
+          <ManageScreen
+            state={state}
+            onAddCategory={addCategory}
+            onRenameCategory={renameCategory}
+            onDeleteCategory={deleteCategory}
+            onSetColor={setCategoryColor}
+            onEditTask={setTaskForm}
+            onDeleteTask={deleteTask}
+          />
+        )}
+        {screen === 'daten' && <DataScreen state={state} onReplace={replaceState} />}
+      </div>
+
+      <TabBar screen={screen} setScreen={setScreen} />
+
+      {counterFor && (
+        <CounterSheet
+          task={counterFor}
+          entry={entryOf(state.log, today, counterFor.id)}
+          onAdd={n => addProgress(counterFor.id, n, today)}
+          onUndo={() => undoLast(counterFor.id, today)}
+          onClose={() => setCounterFor(null)}
+        />
+      )}
+      {taskForm && (
+        <TaskForm
+          initial={taskForm}
+          categories={state.categories}
+          onSave={f => { saveTask(f); setTaskForm(null); }}
+          onClose={() => setTaskForm(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   5. HEUTE
+   ══════════════════════════════════════════════════════════════ */
+function ProgressBar({ ratio, done, color }) {
+  return (
+    <div className="h-1.5 w-full rounded-full bg-line overflow-hidden">
+      <div
+        className="h-full rounded-full transition-all duration-300"
+        style={{
+          width: `${Math.min(100, Math.round(ratio * 100))}%`,
+          backgroundColor: color,
+          opacity: done ? 1 : 0.7
+        }}
+      />
+    </div>
+  );
+}
+
+function CheckCircle({ done, color }) {
+  return (
+    <span
+      className="shrink-0 w-8 h-8 rounded-full border-2 flex items-center justify-center transition-colors"
+      style={{
+        borderColor: done ? color : '#E7E7E1',
+        backgroundColor: done ? color : 'transparent'
+      }}
+      aria-hidden="true"
+    >
+      {done && (
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+          <path d="M3.5 8.5l3 3 6-7" stroke="#FFFFFF" strokeWidth="2"
+                strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+function TaskRow({ task, value, color, onPress }) {
+  const max = baseTarget(task);
+  const done = value >= max;
+  const started = value > 0 && !done;
+  const p = displayProgress(task, value);
+  const isCheck = task.type === 'check';
+
+  return (
+    <button
+      onClick={onPress}
+      aria-pressed={isCheck ? done : undefined}
+      className="w-full text-left px-5 py-4 min-h-[76px] flex flex-col justify-center gap-3 active:bg-paper transition-colors"
+      style={done ? { backgroundColor: tint(color, 0.08) } : undefined}
+    >
+      <div className="flex items-center justify-between gap-4">
+        <span
+          className={`text-[17px] leading-tight ${done ? 'text-muted line-through decoration-2' : ''}`}
+          style={done ? { textDecorationColor: color } : undefined}
+        >
+          {task.name}
+        </span>
+
+        <span className="shrink-0 flex items-center gap-2.5">
+          {!isCheck && (
+            <span className="num text-[15px]"
+                  style={{ color: started ? color : '#8B8B80' }}>
+              {p.cur} / {p.max}{p.unit ? ' ' + p.unit : ''}
+            </span>
+          )}
+          {(isCheck || done) && <CheckCircle done={done} color={color} />}
+        </span>
+      </div>
+      {!isCheck && <ProgressBar ratio={value / max} done={done} color={color} />}
+    </button>
+  );
+}
+
+function TodayScreen({ state, today, tasks, onStartTimer, onCheck, onOpenCounter }) {
+  const active = tasks;
+  const doneCount = active.filter(t => entryOf(state.log, today, t.id).value >= baseTarget(t)).length;
+  const hasAnyTask = state.tasks.some(t => t.active !== false);
+
+  return (
+    <div className="safe-top">
+      <header className="px-5 pt-6 pb-5">
+        <p className="text-[13px] uppercase tracking-[0.14em] text-muted">{fmtDate(today)}</p>
+        <h1 className="mt-2 text-[34px] leading-none font-semibold num">
+          {doneCount}<span className="text-muted font-normal"> / {active.length}</span>
+        </h1>
+        <p className="mt-1.5 text-[14px] text-muted">
+          {active.length === 0 ? 'Heute ist nichts geplant.'
+            : doneCount === active.length ? 'Alles erledigt.' : 'erledigt'}
+        </p>
+      </header>
+
+      {state.categories.map(cat => {
+        const inCat = active.filter(t => t.categoryId === cat.id);
+        if (!inCat.length) return null;
+        return (
+          <section key={cat.id} className="mb-6">
+            <h2 className="px-5 pb-2 text-[12px] uppercase tracking-[0.16em] text-muted flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full" style={{ backgroundColor: cat.color || DEFAULT_COLOR }} />
+              {cat.name}
+            </h2>
+            <div className="bg-card border-y border-line divide-y divide-line">
+              {inCat.map(task => (
+                <TaskRow
+                  key={task.id}
+                  task={task}
+                  color={cat.color || DEFAULT_COLOR}
+                  value={entryOf(state.log, today, task.id).value}
+                  onPress={() => {
+                    if (task.type === 'timer') onStartTimer(task);
+                    else if (task.type === 'check') onCheck(task);
+                    else onOpenCounter(task);
+                  }}
+                />
+              ))}
+            </div>
+          </section>
+        );
+      })}
+
+      {active.length === 0 && (
+        <div className="px-5 py-10 text-[15px] text-muted leading-relaxed">
+          {hasAnyTask
+            ? <>Für heute ist keine Task geplant. Unter <span className="text-ink">Woche</span> kannst du das ändern.</>
+            : <>Lege unter <span className="text-ink">Bearbeiten</span> eine Kategorie und die erste Task an.</>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   6. TIMER-SCREEN
+   ══════════════════════════════════════════════════════════════ */
+function TimerScreen({ task, session, elapsed, alreadyDone, onPause, onRun, onCancel }) {
+  const remaining = Math.max(0, session.durationMs - elapsed);
+  const ratio = 1 - remaining / session.durationMs;
+  const R = 132, C = 2 * Math.PI * R;
+  const creditedMin = Math.floor((alreadyDone + elapsed / 1000) / 60);
+  const notStarted = session.paused && session.accMs === 0;   // noch kein einziger Lauf
+
+  const status = notStarted ? 'Bereit' : session.paused ? 'Pausiert' : 'Timer läuft';
+  const ringColor = notStarted ? '#E7E7E1' : session.paused ? '#8B8B80' : '#4F6F52';
+
+  return (
+    <div className="min-h-screen bg-card flex flex-col safe-top">
+      <header className="px-5 pt-6 pb-2 text-center">
+        <p className="text-[12px] uppercase tracking-[0.16em] text-muted">{status}</p>
+        <h1 className="mt-2 text-[22px]">{task.name}</h1>
+      </header>
+
+      <div className="flex-1 flex items-center justify-center">
+        <div className="relative">
+          <svg width="300" height="300" viewBox="0 0 300 300" className="-rotate-90">
+            <circle cx="150" cy="150" r={R} fill="none" stroke="#E7E7E1" strokeWidth="6" />
+            <circle
+              cx="150" cy="150" r={R} fill="none"
+              stroke={ringColor}
+              strokeWidth="6" strokeLinecap="round"
+              strokeDasharray={C}
+              strokeDashoffset={C * (1 - ratio)}
+              style={{ transition: 'stroke-dashoffset 0.4s linear' }}
+            />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <div className="num text-[56px] leading-none font-light">{fmtClock(remaining)}</div>
+            <div className="mt-3 num text-[14px] text-muted">{creditedMin} / {task.target} Min</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="px-5 pb-6 safe-bottom space-y-3">
+        <button
+          onClick={session.paused ? onRun : onPause}
+          className="w-full h-16 rounded-2xl bg-ink text-card text-[17px] active:opacity-80"
+        >
+          {notStarted ? 'Starten' : session.paused ? 'Weiter' : 'Pause'}
+        </button>
+        <button
+          onClick={onCancel}
+          className="w-full h-16 rounded-2xl border border-line text-[17px] active:bg-paper"
+        >
+          {notStarted ? 'Zurück' : 'Abbrechen'}
+        </button>
+        {!notStarted && (
+          <p className="text-center text-[13px] text-muted">
+            Beim Abbrechen wird die bisherige Zeit gutgeschrieben.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   6b. WOCHE
+   ══════════════════════════════════════════════════════════════ */
+function WeekdayToggles({ selected, onToggle }) {
+  return (
+    <div className="grid grid-cols-7 gap-1.5">
+      {WEEKDAYS_SHORT.map((label, wd) => {
+        const on = selected.includes(wd);
+        return (
+          <button key={wd} onClick={() => onToggle(wd)}
+            className={`h-14 rounded-xl border text-[14px] ${on
+              ? 'border-moss bg-mossLt text-moss' : 'border-line text-muted active:bg-paper'}`}>
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function WeekScreen({ state, today, weekKey, onSetDays }) {
+  const [showNext, setShowNext] = useState(false);      // Sonntag: Folgewoche planen
+  const [dayPicker, setDayPicker] = useState(null);     // Task, deren Tage bearbeitet werden
+  const [addTo, setAddTo] = useState(null);             // Wochentag, dem etwas hinzugefügt wird
+
+  const todayWd = weekdayOfKey(today);
+  const isSunday = todayWd === 0;
+  const shownWeek = showNext ? nextWeekKey(weekKey) : weekKey;
+  const plan = effectivePlan(state, shownWeek);
+  const alreadyPlanned = !!state.plans[shownWeek];
+  const activeTasks = state.tasks.filter(t => t.active !== false);
+  const catName = id => (state.categories.find(c => c.id === id) || {}).name || '';
+
+  const tasksOn = wd => activeTasks.filter(t => (plan[t.id] || []).includes(wd));
+
+  const toggleDay = (taskId, wd) => {
+    const days = plan[taskId] || [];
+    onSetDays(shownWeek, taskId, days.includes(wd) ? days.filter(d => d !== wd) : [...days, wd]);
+  };
+
+  const short = key => dateFromKey(key).toLocaleDateString('de-CH', { day: 'numeric', month: 'short' });
+  const rangeLabel = `${short(shownWeek)} – ${short(dayKeyInWeek(shownWeek, 0))}`;
+
+  return (
+    <div className="safe-top">
+      <header className="px-5 pt-6 pb-5">
+        <h1 className="text-[28px] font-semibold">Woche</h1>
+        <p className="mt-1 text-[14px] text-muted num">
+          {rangeLabel}{showNext && ' · nächste Woche'}
+        </p>
+      </header>
+
+      {isSunday && (
+        <div className="mx-5 mb-6 rounded-2xl bg-mossLt border border-moss/30 px-5 py-4">
+          <p className="text-[12px] uppercase tracking-[0.16em] text-moss">Planungstag</p>
+          <p className="mt-2 text-[15px] leading-relaxed">
+            {showNext
+              ? (alreadyPlanned
+                  ? 'Die nächste Woche ist geplant.'
+                  : 'Ohne Änderung übernimmt die nächste Woche diese Planung.')
+              : 'Heute endet die Woche. Du kannst gleich die nächste planen.'}
+          </p>
+          <button
+            onClick={() => setShowNext(v => !v)}
+            className="mt-3 w-full h-14 rounded-2xl bg-ink text-card text-[16px] active:opacity-80"
+          >
+            {showNext ? 'Zurück zu dieser Woche' : 'Nächste Woche planen'}
+          </button>
+        </div>
+      )}
+
+      {WEEK_ORDER.map(wd => {
+        const tasks = tasksOn(wd);
+        const isToday = !showNext && wd === todayWd;
+        const dayKey = dayKeyInWeek(shownWeek, wd);
+        return (
+          <section key={wd} className="mb-6">
+            <div className="px-5 pb-2 flex items-baseline justify-between">
+              <h2 className={`text-[12px] uppercase tracking-[0.16em] ${isToday ? 'text-moss' : 'text-muted'}`}>
+                {WEEKDAYS[wd]}{isToday && ' · heute'}
+              </h2>
+              <span className="num text-[12px] text-muted">{short(dayKey)}</span>
+            </div>
+
+            <div className={`bg-card border-y divide-y divide-line ${isToday ? 'border-moss/40' : 'border-line'}`}>
+              {tasks.map(t => {
+                const color = colorOfCategory(state.categories, t.categoryId);
+                return (
+                  <button key={t.id} onClick={() => setDayPicker(t)}
+                    className="w-full px-5 py-3 min-h-[60px] flex items-center justify-between gap-3 text-left active:bg-paper">
+                    <span className="flex items-center gap-3 min-w-0">
+                      <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: color }} />
+                      <span className="truncate">
+                        <span className="text-[16px]">{t.name}</span>
+                        <span className="ml-2 text-[13px] text-muted">{catName(t.categoryId)}</span>
+                      </span>
+                    </span>
+                    <span className="num text-[13px] text-muted shrink-0">
+                      {WEEK_ORDER.filter(d => (plan[t.id] || []).includes(d))
+                                 .map(d => WEEKDAYS_SHORT[d]).join(' ')}
+                    </span>
+                  </button>
+                );
+              })}
+              {tasks.length === 0 && (
+                <p className="px-5 py-4 text-[15px] text-muted">Nichts geplant</p>
+              )}
+              <button onClick={() => setAddTo(wd)}
+                className="w-full px-5 py-4 min-h-[56px] text-left text-[16px] text-moss active:bg-paper">
+                + Task an {WEEKDAYS[wd]}
+              </button>
+            </div>
+          </section>
+        );
+      })}
+
+      {dayPicker && (
+        <Sheet title={dayPicker.name} onClose={() => setDayPicker(null)}>
+          <p className="text-[14px] text-muted mb-4">
+            An welchen Tagen dieser Woche soll die Task erscheinen?
+          </p>
+          <WeekdayToggles
+            selected={plan[dayPicker.id] || []}
+            onToggle={wd => toggleDay(dayPicker.id, wd)}
+          />
+          <button
+            onClick={() => { onSetDays(shownWeek, dayPicker.id, []); setDayPicker(null); }}
+            className="mt-4 w-full h-14 rounded-2xl border border-line text-[16px] text-warn active:bg-paper"
+          >
+            Diese Woche ganz weglassen
+          </button>
+          <p className="mt-3 text-[13px] text-muted">
+            Bereits erfasster Fortschritt bleibt bei dem Tag, an dem du ihn erarbeitet hast.
+          </p>
+        </Sheet>
+      )}
+
+      {addTo !== null && (
+        <AddTaskSheet
+          state={state}
+          weekday={addTo}
+          plan={plan}
+          onPick={taskId => { toggleDay(taskId, addTo); setAddTo(null); }}
+          onClose={() => setAddTo(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+/* Zweistufige Auswahl: erst die Kategorie, dann die Task darin. */
+function AddTaskSheet({ state, weekday, plan, onPick, onClose }) {
+  const [catId, setCatId] = useState(null);
+
+  const open = state.tasks.filter(t => t.active !== false && !(plan[t.id] || []).includes(weekday));
+  const cats = state.categories.filter(c => open.some(t => t.categoryId === c.id));
+  const cat = cats.find(c => c.id === catId);
+
+  if (!cat) {
+    return (
+      <Sheet title={`${WEEKDAYS[weekday]} ergänzen`} onClose={onClose}>
+        {cats.length === 0
+          ? <p className="text-[15px] text-muted">Alle Tasks sind an diesem Tag bereits geplant.</p>
+          : (
+            <div className="-mx-5 border-y border-line divide-y divide-line">
+              {cats.map(c => {
+                const n = open.filter(t => t.categoryId === c.id).length;
+                return (
+                  <button key={c.id} onClick={() => setCatId(c.id)}
+                    className="w-full px-5 py-4 min-h-[64px] flex items-center justify-between gap-3 active:bg-paper">
+                    <span className="flex items-center gap-3">
+                      <span className="w-3 h-3 rounded-full shrink-0"
+                            style={{ backgroundColor: c.color || DEFAULT_COLOR }} />
+                      <span className="text-[17px]">{c.name}</span>
+                    </span>
+                    <span className="num text-[14px] text-muted">{n}</span>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+      </Sheet>
+    );
+  }
+
+  return (
+    <Sheet title={cat.name} onClose={onClose}>
+      <button onClick={() => setCatId(null)}
+        className="mb-3 h-11 -ml-1 px-1 text-[15px] text-moss active:opacity-60">
+        ← Alle Kategorien
+      </button>
+      <div className="-mx-5 border-y border-line divide-y divide-line">
+        {open.filter(t => t.categoryId === cat.id).map(t => (
+          <button key={t.id} onClick={() => onPick(t.id)}
+            className="w-full px-5 py-4 min-h-[60px] text-left active:bg-paper">
+            <span className="text-[16px]">{t.name}</span>
+            <span className="ml-2 text-[13px] text-muted">
+              {TYPE_LABEL[t.type]}{t.type !== 'check' && ` · ${t.target}`}
+            </span>
+          </button>
+        ))}
+      </div>
+    </Sheet>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   7. COUNTER-SHEET
+   ══════════════════════════════════════════════════════════════ */
+function Sheet({ title, children, onClose, footer }) {
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col justify-end bg-ink/25" onClick={onClose}>
+      <div
+        className="bg-card rounded-t-3xl max-h-[92vh] overflow-y-auto safe-bottom"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-5 pt-5 pb-3">
+          <h2 className="text-[19px]">{title}</h2>
+          <button onClick={onClose} className="h-11 px-3 -mr-3 text-[15px] text-muted active:opacity-60">
+            Schliessen
+          </button>
+        </div>
+        <div className="px-5 pb-5">{children}</div>
+        {footer}
+      </div>
+    </div>
+  );
+}
+
+function CounterSheet({ task, entry, onAdd, onUndo, onClose }) {
+  const [val, setVal] = useState('');
+  const max = baseTarget(task);
+  const rest = max - entry.value;
+  const submit = () => {
+    const n = parseInt(val, 10);
+    if (!isNaN(n) && n > 0) onAdd(n);
+    setVal('');
+  };
+  return (
+    <Sheet title={task.name} onClose={onClose}>
+      <div className="flex items-baseline justify-between">
+        <span className="num text-[34px]">{entry.value}<span className="text-muted"> / {task.target}</span></span>
+        <span className="text-[14px] text-muted">{rest > 0 ? `noch ${rest}` : 'Ziel erreicht'}</span>
+      </div>
+      <div className="mt-4"><ProgressBar ratio={entry.value / max} done={rest <= 0} /></div>
+
+      <div className="mt-6 flex gap-2">
+        {[1, 5, 10].map(n => (
+          <button key={n} onClick={() => onAdd(n)} disabled={rest <= 0}
+            className="flex-1 h-14 rounded-2xl border border-line num text-[17px] active:bg-paper disabled:opacity-30">
+            +{n}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3 flex gap-2">
+        <input
+          type="number" inputMode="numeric" min="1" placeholder="Anzahl"
+          value={val} onChange={e => setVal(e.target.value)}
+          className="flex-1 h-14 rounded-2xl border border-line px-4 num outline-none focus:border-moss"
+        />
+        <button onClick={submit} disabled={rest <= 0}
+          className="h-14 px-6 rounded-2xl bg-ink text-card text-[17px] active:opacity-80 disabled:opacity-30">
+          Eintragen
+        </button>
+      </div>
+
+      <button
+        onClick={onUndo}
+        disabled={!entry.entries.length}
+        className="mt-3 w-full h-14 rounded-2xl border border-line text-[16px] text-warn active:bg-paper disabled:opacity-30 disabled:text-muted"
+      >
+        {entry.entries.length
+          ? `Letzte Eingabe rückgängig (+${entry.entries[entry.entries.length - 1].amount})`
+          : 'Keine Eingabe zum Rückgängigmachen'}
+      </button>
+      <p className="mt-3 text-[13px] text-muted">Eingaben über das Ziel hinaus werden gekappt.</p>
+    </Sheet>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   8. VERWALTEN
+   ══════════════════════════════════════════════════════════════ */
+const TYPE_LABEL = { timer: 'Timer', counter: 'Counter', check: 'Check' };
+
+function ColorSheet({ category, onPick, onClose }) {
+  return (
+    <Sheet title={`Farbe für ${category.name}`} onClose={onClose}>
+      <div className="grid grid-cols-4 gap-3">
+        {CATEGORY_COLORS.map(c => {
+          const on = (category.color || DEFAULT_COLOR) === c.hex;
+          return (
+            <button key={c.hex} onClick={() => { onPick(c.hex); onClose(); }}
+              className="h-20 rounded-2xl border flex flex-col items-center justify-center gap-2"
+              style={{ borderColor: on ? c.hex : '#E7E7E1', backgroundColor: on ? tint(c.hex, 0.1) : 'transparent' }}>
+              <span className="w-7 h-7 rounded-full" style={{ backgroundColor: c.hex }} />
+              <span className="text-[12px] text-muted">{c.name}</span>
+            </button>
+          );
+        })}
+      </div>
+      <p className="mt-4 text-[13px] text-muted">
+        Die Farbe erscheint auf „Heute" und „Woche" bei allen Tasks dieser Kategorie.
+      </p>
+    </Sheet>
+  );
+}
+
+function ManageScreen({ state, onAddCategory, onRenameCategory, onDeleteCategory,
+                        onSetColor, onEditTask, onDeleteTask }) {
+  const [newCat, setNewCat] = useState('');
+  const [colorFor, setColorFor] = useState(null);
+  return (
+    <div className="safe-top">
+      <header className="px-5 pt-6 pb-5">
+        <h1 className="text-[28px] font-semibold">Bearbeiten</h1>
+        <p className="mt-1 text-[14px] text-muted">Kategorien und Tasks anlegen, bearbeiten, löschen.</p>
+      </header>
+
+      <div className="px-5 pb-6 flex gap-2">
+        <input
+          value={newCat} onChange={e => setNewCat(e.target.value)}
+          placeholder="Neue Kategorie"
+          className="flex-1 h-14 rounded-2xl border border-line px-4 outline-none focus:border-moss bg-card"
+        />
+        <button
+          onClick={() => { if (newCat.trim()) { onAddCategory(newCat.trim()); setNewCat(''); } }}
+          className="h-14 px-6 rounded-2xl bg-ink text-card active:opacity-80"
+        >
+          Hinzufügen
+        </button>
+      </div>
+
+      {state.categories.map(cat => {
+        const tasks = state.tasks.filter(t => t.categoryId === cat.id);
+        return (
+          <section key={cat.id} className="mb-6">
+            <div className="px-5 pb-2 flex items-center justify-between">
+              <button onClick={() => setColorFor(cat)}
+                className="flex items-center gap-2 h-11 -ml-1 px-1 active:opacity-60">
+                <span className="w-3.5 h-3.5 rounded-full"
+                      style={{ backgroundColor: cat.color || DEFAULT_COLOR }} />
+                <h2 className="text-[12px] uppercase tracking-[0.16em] text-muted">{cat.name}</h2>
+              </button>
+              <div className="flex gap-1 -mr-2">
+                <button
+                  onClick={() => {
+                    const n = window.prompt('Kategorie umbenennen', cat.name);
+                    if (n && n.trim()) onRenameCategory(cat.id, n.trim());
+                  }}
+                  className="h-11 px-3 text-[14px] text-muted active:opacity-60">Umbenennen</button>
+                <button
+                  onClick={() => {
+                    if (window.confirm(`„${cat.name}“ und ${tasks.length} Task(s) löschen?`)) onDeleteCategory(cat.id);
+                  }}
+                  className="h-11 px-3 text-[14px] text-warn active:opacity-60">Löschen</button>
+              </div>
+            </div>
+
+            <div className="bg-card border-y border-line divide-y divide-line">
+              {tasks.map(t => (
+                <div key={t.id} className="px-5 py-3 min-h-[72px] flex items-center justify-between gap-3">
+                  <button onClick={() => onEditTask(t)} className="flex-1 text-left py-2">
+                    <div className="text-[17px]">{t.name}</div>
+                    <div className="mt-0.5 text-[13px] text-muted num">
+                      {TYPE_LABEL[t.type]}
+                      {t.type === 'timer' && ` · ${t.target} Min`}
+                      {t.type === 'counter' && ` · Ziel ${t.target}`}
+                      {t.active === false && ' · pausiert'}
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => { if (window.confirm(`„${t.name}“ löschen?`)) onDeleteTask(t.id); }}
+                    className="h-12 px-3 text-[14px] text-warn active:opacity-60">Löschen</button>
+                </div>
+              ))}
+              <button
+                onClick={() => onEditTask({ categoryId: cat.id, name: '', type: 'timer', target: 15, active: true, plannedWeekdays: [0,1,2,3,4,5,6] })}
+                className="w-full px-5 py-4 min-h-[60px] text-left text-[16px] text-moss active:bg-paper">
+                + Task in {cat.name}
+              </button>
+            </div>
+          </section>
+        );
+      })}
+
+      {state.categories.length === 0 && (
+        <p className="px-5 text-[15px] text-muted">Noch keine Kategorie. Oben eine anlegen.</p>
+      )}
+
+      {colorFor && (
+        <ColorSheet
+          category={colorFor}
+          onPick={hex => onSetColor(colorFor.id, hex)}
+          onClose={() => setColorFor(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function TaskForm({ initial, categories, onSave, onClose }) {
+  const [f, setF] = useState({ target: 15, ...initial });
+  // Das Zielfeld wird als Text geführt, damit es zwischendurch leer sein darf.
+  // Umgerechnet wird erst beim Sichern.
+  const [targetRaw, setTargetRaw] = useState(String(initial.target != null ? initial.target : 15));
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const parsedTarget = parseInt(targetRaw, 10);
+  const targetOk = f.type === 'check' || (!isNaN(parsedTarget) && parsedTarget >= 1);
+  const valid = f.name.trim() && f.categoryId && targetOk;
+
+  return (
+    <Sheet title={initial.id ? 'Task bearbeiten' : 'Neue Task'} onClose={onClose}>
+      <label className="block text-[13px] text-muted mb-2">Name</label>
+      <input
+        value={f.name} onChange={e => set('name', e.target.value)}
+        placeholder="z.B. Klavier"
+        className="w-full h-14 rounded-2xl border border-line px-4 outline-none focus:border-moss"
+      />
+
+      <label className="block text-[13px] text-muted mt-5 mb-2">Kategorie</label>
+      <select
+        value={f.categoryId} onChange={e => set('categoryId', e.target.value)}
+        className="w-full h-14 rounded-2xl border border-line px-4 bg-card outline-none focus:border-moss"
+      >
+        {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+      </select>
+
+      <label className="block text-[13px] text-muted mt-5 mb-2">Typ</label>
+      <div className="grid grid-cols-3 gap-2">
+        {['timer', 'counter', 'check'].map(t => (
+          <button key={t} onClick={() => set('type', t)}
+            className={`h-14 rounded-2xl border text-[15px] ${f.type === t
+              ? 'border-moss bg-mossLt text-moss' : 'border-line active:bg-paper'}`}>
+            {TYPE_LABEL[t]}
+          </button>
+        ))}
+      </div>
+
+      {f.type !== 'check' && (
+        <>
+          <label className="block text-[13px] text-muted mt-5 mb-2">
+            {f.type === 'timer' ? 'Ziel in Minuten' : 'Ziel (Anzahl)'}
+          </label>
+          <input
+            type="number" inputMode="numeric" min="1"
+            value={targetRaw}
+            onChange={e => setTargetRaw(e.target.value)}
+            className="w-full h-14 rounded-2xl border border-line px-4 num outline-none focus:border-moss"
+          />
+        </>
+      )}
+
+      <label className="block text-[13px] text-muted mt-5 mb-2">Standardtage</label>
+      <WeekdayToggles
+        selected={normalizeWeekdays(f.plannedWeekdays)}
+        onToggle={wd => {
+          const days = normalizeWeekdays(f.plannedWeekdays);
+          set('plannedWeekdays', days.includes(wd) ? days.filter(d => d !== wd) : [...days, wd].sort());
+        }}
+      />
+      <p className="mt-2 text-[13px] text-muted">
+        Gilt für neue Wochen. Die laufende Woche stellst du unter „Woche" um.
+      </p>
+
+      <button
+        onClick={() => set('active', f.active === false)}
+        className="mt-5 w-full h-14 rounded-2xl border border-line px-4 flex items-center justify-between active:bg-paper"
+      >
+        <span className="text-[16px]">In „Heute“ anzeigen</span>
+        <span className={`text-[15px] ${f.active === false ? 'text-muted' : 'text-moss'}`}>
+          {f.active === false ? 'Aus' : 'An'}
+        </span>
+      </button>
+
+      <button
+        onClick={() => valid && onSave({
+          ...f,
+          name: f.name.trim(),
+          target: f.type === 'check' ? 1 : parsedTarget
+        })}
+        disabled={!valid}
+        className="mt-6 w-full h-16 rounded-2xl bg-ink text-card text-[17px] active:opacity-80 disabled:opacity-30"
+      >
+        Sichern
+      </button>
+    </Sheet>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   9. DATEN
+   ══════════════════════════════════════════════════════════════ */
+function DataScreen({ state, onReplace }) {
+  const json = useMemo(() => JSON.stringify(state, null, 2), [state]);
+  const [paste, setPaste] = useState('');
+  const [msg, setMsg] = useState('');
+
+  const download = () => {
+    const blob = new Blob([json], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `tagesplan-${todayKey()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+
+  const doImport = text => {
+    try {
+      const parsed = JSON.parse(text);
+      if (!Array.isArray(parsed.tasks) || !Array.isArray(parsed.categories)) {
+        setMsg('Datei enthält keine Kategorien und Tasks.'); return;
+      }
+      onReplace(migrate(parsed));
+      setMsg('Import übernommen.');
+      setPaste('');
+    } catch (e) {
+      setMsg('Das ist kein gültiges JSON.');
+    }
+  };
+
+  return (
+    <div className="safe-top">
+      <header className="px-5 pt-6 pb-5">
+        <h1 className="text-[28px] font-semibold">Daten</h1>
+        <p className="mt-1 text-[14px] text-muted">Alles bleibt auf diesem Gerät.</p>
+      </header>
+
+      <section className="px-5 pb-8">
+        <h2 className="text-[12px] uppercase tracking-[0.16em] text-muted mb-3">Export</h2>
+        <textarea readOnly value={json}
+          className="w-full h-40 rounded-2xl border border-line p-4 text-[12px] num bg-card" />
+        <div className="mt-3 flex gap-2">
+          <button onClick={() => {
+              navigator.clipboard ? navigator.clipboard.writeText(json).then(() => setMsg('In die Zwischenablage kopiert.'))
+                                  : setMsg('Kopieren nicht verfügbar — Text markieren.');
+            }}
+            className="flex-1 h-14 rounded-2xl border border-line active:bg-paper">Kopieren</button>
+          <button onClick={download}
+            className="flex-1 h-14 rounded-2xl bg-ink text-card active:opacity-80">Als Datei sichern</button>
+        </div>
+      </section>
+
+      <section className="px-5 pb-10">
+        <h2 className="text-[12px] uppercase tracking-[0.16em] text-muted mb-3">Import</h2>
+        <p className="text-[14px] text-muted mb-3">Ersetzt den gesamten Zustand.</p>
+        <textarea value={paste} onChange={e => setPaste(e.target.value)}
+          placeholder="JSON hier einfügen"
+          className="w-full h-32 rounded-2xl border border-line p-4 text-[12px] num bg-card outline-none focus:border-moss" />
+        <button onClick={() => doImport(paste)} disabled={!paste.trim()}
+          className="mt-3 w-full h-14 rounded-2xl bg-ink text-card active:opacity-80 disabled:opacity-30">
+          Aus Text importieren
+        </button>
+
+        <label className="mt-3 w-full h-14 rounded-2xl border border-line flex items-center justify-center active:bg-paper cursor-pointer">
+          <span>Datei wählen</span>
+          <input type="file" accept="application/json,.json" className="hidden"
+            onChange={e => {
+              const file = e.target.files && e.target.files[0];
+              if (!file) return;
+              const r = new FileReader();
+              r.onload = () => doImport(String(r.result));
+              r.readAsText(file);
+              e.target.value = '';
+            }} />
+        </label>
+
+        {msg && <p className="mt-4 text-[14px] text-moss">{msg}</p>}
+      </section>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════
+   10. TAB-LEISTE
+   ══════════════════════════════════════════════════════════════ */
+function TabBar({ screen, setScreen }) {
+  const tabs = [['heute', 'Heute'], ['woche', 'Woche'], ['verwalten', 'Bearbeiten'], ['daten', 'Daten']];
+  return (
+    <nav className="fixed bottom-0 inset-x-0 bg-card/95 backdrop-blur border-t border-line safe-bottom">
+      <div className="flex">
+        {tabs.map(([key, label]) => (
+          <button key={key} onClick={() => setScreen(key)}
+            className={`flex-1 h-16 text-[15px] ${screen === key ? 'text-ink' : 'text-muted'} active:opacity-60`}>
+            <span className={screen === key ? 'border-b-2 border-moss pb-1' : ''}>{label}</span>
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
